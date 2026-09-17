@@ -112,6 +112,26 @@ def app_jwt(app_id: str, pem: str) -> str:
     return f"{header}.{payload}.{b64url(signed.stdout)}"
 
 
+def to_pkcs8(pem: str) -> str:
+    """GitHub hands back a PKCS#1 key (BEGIN RSA PRIVATE KEY). WebCrypto's
+    importKey only accepts PKCS#8, so the control plane cannot sign with it and
+    reports the App as unconfigured rather than as holding a bad key."""
+    if "BEGIN RSA PRIVATE KEY" not in pem:
+        return pem
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=True) as f:
+        f.write(pem)
+        f.flush()
+        out = subprocess.run(
+            ["openssl", "pkcs8", "-topk8", "-inform", "PEM", "-outform", "PEM",
+             "-nocrypt", "-in", f.name],
+            capture_output=True,
+            check=True,
+        ).stdout.decode()
+    if not out.startswith("-----BEGIN PRIVATE KEY-----"):
+        raise SystemExit("PKCS#8 conversion produced unexpected output")
+    return out.strip()
+
+
 def manifest(name: str, hook_url: str = "") -> dict:
     man = {
         "name": name,
@@ -277,7 +297,7 @@ def main() -> None:
     else:
         created = create_app(args.name, args.owner, args.hook_url)
         app_id = str(created["id"])
-        pem = created["pem"]
+        pem = to_pkcs8(created["pem"])
         slug = created["slug"]
         write_env(
             {
