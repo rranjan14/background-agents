@@ -123,6 +123,11 @@ def manifest(name: str, hook_url: str = "") -> dict:
             "actions": "read",
             "checks": "read",
             "metadata": "read",
+            # An account permission, not a repository one. The identity resolver
+            # calls /user/emails on every GitHub sign-in whichever allowlist is in
+            # use, and without this the callback fails with "GitHub email lookup
+            # was not successful" and a 500.
+            "email_addresses": "read",
         },
         "default_events": [],
     }
