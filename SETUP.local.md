@@ -58,6 +58,15 @@ No webhook is set. GitHub validates `hook_attributes.url` on submission even whe
 and refuses any host it cannot reach, so the key is omitted until github-bot has a public URL. Pass
 `--hook-url` then.
 
+**`email_addresses` is not optional.** GETTING_STARTED presents the Email addresses account
+permission as conditional on `allowed_emails` / `allowed_email_domains`, but the identity resolver
+calls `/user/emails` on every GitHub sign-in whatever allowlist is in use. An App without it fails
+the OAuth callback with `GitHub email lookup was not successful` and a bare HTTP 500 in the browser;
+the reason only appears in `docker compose logs app`. The manifest in the script requests it now.
+GitHub has no API for changing an App's permissions, so an App that predates this needs the UI:
+_Permissions & events_ → _Account permissions_ → _Email addresses: Read-only_, then accept the
+request on the installation, which GitHub does not apply until you do.
+
 > **Installed on all repositories.** `repository_selection` is `all`, so the app can write to every
 > repo under `rranjan14` — about thirty of them. Narrow it at
 > <https://github.com/settings/installations/162586559> → _Only select repositories_. Autonomous
