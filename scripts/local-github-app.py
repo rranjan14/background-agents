@@ -15,10 +15,9 @@ Usage:
 No webhook is configured: GitHub rejects a hook URL it cannot reach, and the
 github-bot service has no public URL yet. Pass --hook-url once it does.
 
-The manifest flow accepts repository and organization permissions only, so the
-Email addresses ACCOUNT permission cannot be set here and must be added in the
-UI afterwards. Sign-in calls /user/emails unconditionally and 500s without it.
-The script prints the two URLs when it finishes.
+Sign-in calls /user/emails unconditionally and 500s without the Email addresses
+account permission, whose slug is "emails". Changing it on an EXISTING app also
+needs the installation to accept the new permission before it takes effect.
 
 Stdlib plus the openssl binary. No new dependencies.
 """
@@ -128,6 +127,12 @@ def manifest(name: str, hook_url: str = "") -> dict:
             "actions": "read",
             "checks": "read",
             "metadata": "read",
+            # An account permission, not a repository one: GitHub's slug is
+            # "emails", and "email_addresses" is rejected as an unknown resource.
+            # The identity resolver calls /user/emails on every GitHub sign-in
+            # whichever allowlist is in use, and without this the OAuth callback
+            # fails with "GitHub email lookup was not successful" and a 500.
+            "emails": "read",
         },
         "default_events": [],
     }
@@ -285,11 +290,11 @@ def main() -> None:
         )
         print(f"Wrote app id, OAuth client pair and private key for {slug} to .env")
         print(
-            "\nOne permission the manifest cannot carry. Sign-in calls /user/emails on every\n"
-            "attempt and returns a bare 500 without it, so set it now:\n"
+            "\nIf sign-in 500s with 'GitHub email lookup was not successful', the Email\n"
+            "addresses account permission did not take. Check it at:\n"
             f"  https://github.com/settings/apps/{slug}/permissions\n"
-            "  Account permissions -> Email addresses -> Read-only -> Save changes\n"
-            "(it is a separate section below Repository permissions, with its own save)"
+            "  Account permissions -> Email addresses -> Read-only (its own Save changes)\n"
+            "An existing installation must then ACCEPT the new permission separately."
         )
 
     write_env({"GITHUB_APP_INSTALLATION_ID": wait_for_install(app_id, pem, slug)})
