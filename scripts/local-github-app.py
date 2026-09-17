@@ -12,6 +12,9 @@ Usage:
     python3 scripts/local-github-app.py                 # create, then wait for install
     python3 scripts/local-github-app.py --install-only  # app exists; just find its install
 
+No webhook is configured: GitHub rejects a hook URL it cannot reach, and the
+github-bot service has no public URL yet. Pass --hook-url once it does.
+
 Stdlib plus the openssl binary. No new dependencies.
 """
 
@@ -105,15 +108,12 @@ def app_jwt(app_id: str, pem: str) -> str:
     return f"{header}.{payload}.{b64url(signed.stdout)}"
 
 
-def manifest(name: str) -> dict:
-    return {
+def manifest(name: str, hook_url: str = "") -> dict:
+    man = {
         "name": name,
         "url": "http://localhost:3000",
         "redirect_url": REDIRECT,
         "callback_urls": ["http://localhost:3000/api/auth/callback/github"],
-        # Inactive until the github-bot service is deployed; the URL is recorded
-        # now so enabling it later is one checkbox.
-        "hook_attributes": {"url": "http://localhost:8787/webhooks/github", "active": False},
         "public": False,
         "request_oauth_on_install": False,
         "default_permissions": {
@@ -126,6 +126,13 @@ def manifest(name: str) -> dict:
         },
         "default_events": [],
     }
+    # GitHub validates hook_attributes.url even when active is false and refuses
+    # anything it cannot reach, localhost included. The webhook only matters once
+    # the github-bot service is deployed behind a public URL, so leave the key out
+    # until there is one to give.
+    if hook_url:
+        man["hook_attributes"] = {"url": hook_url, "active": True}
+    return man
 
 
 # ------------------------------------------------------------------------- serve
@@ -134,8 +141,9 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Create GitHub App</title>
 <style>body{{font:16px system-ui;margin:4rem auto;max-width:34rem;line-height:1.5}}
 button{{font:inherit;padding:.6rem 1.1rem;border-radius:6px;border:1px solid #888;cursor:pointer}}</style>
 <h2>Create the Open-Inspect GitHub App</h2>
-<p>Permissions, callback URL and webhook settings are pre-filled. GitHub will
-ask you to confirm, then send the credentials straight back here.</p>
+<p>Permissions and the OAuth callback URL are pre-filled. No webhook is set;
+add one later when the github-bot service has a public URL. GitHub will ask you
+to confirm, then send the credentials straight back here.</p>
 <form id=f method=post action="{action}">
 <input type=hidden name=manifest value='{manifest}'>
 <button type=submit>Create GitHub App on GitHub &rarr;</button></form>
@@ -151,6 +159,7 @@ class Handler(BaseHTTPRequestHandler):
     result: dict | None = None
     app_name = ""
     owner = ""
+    hook_url = ""
 
     def log_message(self, *_args):  # quiet
         pass
@@ -172,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(
                 PAGE.format(
                     action=action,
-                    manifest=json.dumps(manifest(Handler.app_name)).replace("'", "&apos;"),
+                    manifest=json.dumps(manifest(Handler.app_name, Handler.hook_url)).replace("'", "&apos;"),
                 )
             )
             return
@@ -199,9 +208,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def create_app(name: str, owner: str) -> dict:
+def create_app(name: str, owner: str, hook_url: str) -> dict:
     Handler.app_name = name
     Handler.owner = owner
+    Handler.hook_url = hook_url
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://localhost:{PORT}/"
     print(f"Open {url} and click the button (opening it now).")
@@ -242,6 +252,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default="open-inspect-rranjan14", help="globally unique app name")
     parser.add_argument("--owner", default="", help="org to create the app under (default: your account)")
+    parser.add_argument("--hook-url", default="", help="public webhook URL; omitted entirely when unset, because GitHub rejects unreachable hook URLs")
     parser.add_argument("--install-only", action="store_true", help="app exists; only resolve the installation id")
     args = parser.parse_args()
 
@@ -254,7 +265,7 @@ def main() -> None:
         if not app_id or not pem:
             raise SystemExit("GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY are not set in .env")
     else:
-        created = create_app(args.name, args.owner)
+        created = create_app(args.name, args.owner, args.hook_url)
         app_id = str(created["id"])
         pem = created["pem"]
         slug = created["slug"]
