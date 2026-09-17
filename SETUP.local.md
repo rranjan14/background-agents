@@ -45,35 +45,47 @@ docker compose down                   # volume survives; `down -v` deletes it
 
 ### 1. GitHub App
 
-One App covers both repository access and sign-in. At <https://github.com/settings/apps>:
+```bash
+python3 scripts/local-github-app.py
+```
 
-- Name: globally unique, e.g. `open-inspect-rranjan14`
-- Homepage URL: `http://localhost:3000`
-- Callback URL: `http://localhost:3000/api/auth/callback/github`
-- Webhook: leave **inactive** for now (the GitHub bot turns it on later)
-- Keep **User-to-server token expiration** active. Without it GitHub issues no refresh token, so PRs
-  get attributed to the bot instead of to you.
-- Repository permissions: Contents **R/W**, Pull requests **R/W**, Issues **R/W**, Actions **R**,
-  Checks **R**, Metadata **R**
-- Install it on **one scratch repo only**.
+One button in the browser. The script sends GitHub a pre-filled App Manifest (the six permissions
+below, the OAuth callback, webhook off), takes the credentials back from the conversion endpoint,
+writes `GITHUB_APP_ID`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY` and
+`GITHUB_BOT_USERNAME` into `.env`, then opens the install page and polls until it can fill in
+`GITHUB_APP_INSTALLATION_ID`. Install on **one scratch repo**, not on all repositories.
 
-Then fill in `.env`: `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` (the number at the end of the
-install URL), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `GITHUB_APP_PRIVATE_KEY`. The private
-key is PEM text on one line — either double-quoted with real newlines, or with a literal `\n` in
-place of each newline.
+`--name` if `open-inspect-rranjan14` is taken (App names are globally unique). `--owner <org>` to
+create it under an organization instead of your account.
 
-### 2. E2B template
+What the manifest sets, for reference: Contents **R/W**, Pull requests **R/W**, Issues **R/W**,
+Actions **R**, Checks **R**, Metadata **R**; callback
+`http://localhost:3000/api/auth/callback/github`; webhook `/webhooks/github` recorded but inactive
+until the github-bot service is deployed.
+
+Newly created Apps keep **User-to-server token expiration** on by default, which is what makes
+GitHub return a refresh token. Without it, PRs get attributed to the bot instead of to you.
+
+### 2. E2B template — done
+
+Built and verified (`py5sz6sf64euaukk3cys`, 2 cpu / 4096 MB, alias
+`open-inspect-sandbox-717d5d2aa5da-1789677100517008000`). `E2B_API_KEY`, `E2B_TEMPLATE_ID`,
+`E2B_SANDBOX_TIMEOUT_SECONDS=3300` and `E2B_AUTO_PAUSE=true` are set, and the control plane has
+them.
+
+`E2B_TEMPLATE_ID` means two different things and the build silently disagrees with the runtime about
+which. `build-template.py` treats it as a **name prefix** and publishes under
+`{prefix}-{buildHash}-{nanos}`; the control plane treats it as the **template ID** to create
+sandboxes from. Setting it to the plain name you built with leaves the runtime pointing at a
+template that was never published. Take the `reference` the build prints and put that in `.env`.
+
+To rebuild after changing `packages/sandbox-runtime/src` or the image packages:
 
 ```bash
 cd packages/e2b-infra
-uv sync --frozen
-export E2B_API_KEY=e2b_…
-export E2B_TEMPLATE_ID=open-inspect-sandbox
-uv run python build-template.py
+E2B_API_KEY=… E2B_TEMPLATE_ID=open-inspect-sandbox uv run python build-template.py
+# then copy the printed reference into E2B_TEMPLATE_ID in .env and: docker compose up -d app
 ```
-
-Set `E2B_API_KEY` and `E2B_TEMPLATE_ID` in `.env` too. On the Hobby tier the runtime cap is about an
-hour, so set `E2B_SANDBOX_TIMEOUT_SECONDS=3300`.
 
 ### 3. Tunnel
 
