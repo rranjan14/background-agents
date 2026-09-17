@@ -43,28 +43,25 @@ docker compose down                   # volume survives; `down -v` deletes it
 
 ## Left to do
 
-### 1. GitHub App
+### 1. GitHub App — done
 
-```bash
-python3 scripts/local-github-app.py
-```
+`open-inspect-rranjan14` (app `4982553`, installation `162586559`, bot
+`open-inspect-rranjan14[bot]`). Credentials verified: the app JWT authenticates and the installation
+token lists repositories. Permissions are exactly Contents R/W, Pull requests R/W, Issues R/W,
+Actions R, Checks R, Metadata R.
 
-One button in the browser. The script sends GitHub a pre-filled App Manifest (the six permissions
-below, the OAuth callback, webhook off), takes the credentials back from the conversion endpoint,
-writes `GITHUB_APP_ID`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY` and
-`GITHUB_BOT_USERNAME` into `.env`, then opens the install page and polls until it can fill in
-`GITHUB_APP_INSTALLATION_ID`. Install on **one scratch repo**, not on all repositories.
+Created with `scripts/local-github-app.py`, which sends GitHub a pre-filled App Manifest and writes
+every credential into `.env` itself. Re-run it with `--name` for a second app, or `--install-only`
+to re-resolve an installation id.
 
-`--name` if `open-inspect-rranjan14` is taken (App names are globally unique). `--owner <org>` to
-create it under an organization instead of your account.
+No webhook is set. GitHub validates `hook_attributes.url` on submission even when `active` is false
+and refuses any host it cannot reach, so the key is omitted until github-bot has a public URL. Pass
+`--hook-url` then.
 
-What the manifest sets, for reference: Contents **R/W**, Pull requests **R/W**, Issues **R/W**,
-Actions **R**, Checks **R**, Metadata **R**; callback
-`http://localhost:3000/api/auth/callback/github`; webhook `/webhooks/github` recorded but inactive
-until the github-bot service is deployed.
-
-Newly created Apps keep **User-to-server token expiration** on by default, which is what makes
-GitHub return a refresh token. Without it, PRs get attributed to the bot instead of to you.
+> **Installed on all repositories.** `repository_selection` is `all`, so the app can write to every
+> repo under `rranjan14` — about thirty of them. Narrow it at
+> <https://github.com/settings/installations/162586559> → _Only select repositories_. Autonomous
+> agents hold this token.
 
 ### 2. E2B template — done
 
@@ -87,16 +84,22 @@ E2B_API_KEY=… E2B_TEMPLATE_ID=open-inspect-sandbox uv run python build-templat
 # then copy the printed reference into E2B_TEMPLATE_ID in .env and: docker compose up -d app
 ```
 
-### 3. Tunnel
+### 3. Tunnel — done
 
-A sandbox opens a WebSocket back to `WORKER_URL`, which is `http://localhost:8787` right now and
-unreachable from E2B. Start a tunnel and point `WORKER_URL` at it:
+`WORKER_URL=https://fine-collected-technological-henry.trycloudflare.com`, verified reaching
+`/healthz` through the tunnel. `WEB_APP_URL` stays `http://localhost:3000`, because browser sign-in
+is origin-bound.
+
+A `trycloudflare` quick tunnel gets a **new hostname every time cloudflared restarts**, and a stale
+`WORKER_URL` fails sandboxes at the point where the bridge phones home, which reads as a session
+that never becomes ready. After any cloudflared restart:
 
 ```bash
-cloudflared tunnel --url http://localhost:8787
+sed -i '' "s|^WORKER_URL=.*|WORKER_URL=<new-url>|" .env && docker compose up -d app
 ```
 
-`WEB_APP_URL` stays `http://localhost:3000`, because browser sign-in is origin-bound.
+A named tunnel on a domain you own avoids the churn, and is worth it as soon as this is more than an
+experiment.
 
 ### 4. Anthropic key
 
@@ -119,6 +122,11 @@ your name on it, not the bot's.
 - Cron automations and webhook triggers: `docs/AUTOMATIONS.md`.
 
 ## Caveats
+
+The tunnel puts the control plane on the public internet. `APP_BIND_ADDRESS` stays on loopback, but
+cloudflared runs on the host and forwards to it, so anyone with the hostname reaches `/healthz` and
+every unauthenticated route. Session routes need their tokens and sign-in needs `ALLOWED_USERS`, but
+treat the URL as a secret and stop cloudflared when not testing.
 
 Upstream is explicit that this is **single-tenant**: every user is trusted and reaches the same
 repositories. Keep it on loopback, keep `ALLOWED_USERS` tight, and do not expose :8787 without Caddy
