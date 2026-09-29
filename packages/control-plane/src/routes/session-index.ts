@@ -25,6 +25,7 @@ import {
   json,
   SCM_AGNOSTIC_HUMAN_USER_ROUTE,
   requirePermission,
+  requireSession,
   type RequestContext,
   type UserRouteContext,
 } from "./shared";
@@ -86,8 +87,19 @@ export async function handleListSessions(
   const parsedQuery = parseSessionListQuery(url.searchParams);
   if (!parsedQuery.success) return error(`Invalid ${parsedQuery.invalidParam}`, 400);
 
-  const { createdBy, status, excludeStatus, excludeAutomationLineage, limit, offset } =
-    parsedQuery.data;
+  const {
+    createdBy,
+    status,
+    excludeStatus,
+    excludeAutomationLineage,
+    q,
+    repoOwner,
+    repoName,
+    environmentId,
+    origin,
+    limit,
+    offset,
+  } = parsedQuery.data;
   const viewerUserId =
     ctx.principal?.kind === "user"
       ? ctx.principal.userId
@@ -107,6 +119,10 @@ export async function handleListSessions(
     excludeStatus,
     excludeAutomationLineage,
     createdByUserIds,
+    ...(q ? { search: q } : {}),
+    ...(repoOwner && repoName ? { repository: { repoOwner, repoName } } : {}),
+    ...(environmentId ? { environmentId } : {}),
+    ...(origin ? { spawnSource: origin } : {}),
     limit,
     offset,
     ...(viewerUserId ? { viewerUserId } : {}),
@@ -269,11 +285,11 @@ sessionIndexRoutes.get(
 );
 sessionIndexRoutes.patch(
   "/sessions/:id/read-state",
-  admit({ ...SCM_AGNOSTIC_HUMAN_USER_ROUTE, authorization: requirePermission("sessions.read") }),
+  admit({ ...SCM_AGNOSTIC_HUMAN_USER_ROUTE, authorization: requireSession("read") }),
   (c) => dispatch(c, handlePatchReadState)
 );
 sessionIndexRoutes.delete(
   "/sessions/:id",
-  admit({ ...GITHUB_USER_OR_SERVICE_ROUTE, authorization: requirePermission("sessions.delete") }),
+  admit({ ...GITHUB_USER_OR_SERVICE_ROUTE, authorization: requireSession("delete") }),
   (c) => dispatch(c, handleDeleteSession)
 );
