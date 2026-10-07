@@ -1,4 +1,5 @@
 import { DEFAULT_HARNESS, type HarnessId } from "@open-inspect/shared/harnesses";
+import type { SessionMemorySelection } from "../memory/types";
 import {
   type PullRequestSummary,
   type SessionReadAction,
@@ -13,10 +14,14 @@ import {
 } from "@open-inspect/shared/session-list-query";
 import type { SessionListRepository } from "@open-inspect/shared/types/repositories";
 import type { SessionVisibility } from "@open-inspect/shared/types/teams";
+import { visibleSessionsPredicate, type SessionReadScope } from "./session-visibility";
+import { assertD1QueryParameterLimit, MAX_D1_QUERY_PARAMETERS } from "./query-limits";
+import type { TeamsEnforcementMode } from "../authorization/teams-enforcement";
 import {
   sessionModelProviderAuthSchema,
   SUBSCRIPTION_PROVIDER_IDS,
 } from "@open-inspect/shared/types/provider-accounts";
+import type { Pinned } from "../session/pinned";
 import type { SessionSkillManifestInput } from "../session/skill-resolution";
 import {
   assertProviderAuthSelection,
@@ -24,6 +29,7 @@ import {
   type SessionModelProviderAuthInput,
 } from "../model-provider-accounts/provider-auth-contracts";
 import { bulkInsertStatements } from "./bulk-insert";
+import { SessionMemorySelectionStore } from "./session-memory-selections";
 import { SessionStatusProjectionStore } from "./session-status-projection-store";
 import { attachSessionListMetadata } from "./session-list-metadata";
 import { buildSessionListPredicates, type SessionListFilters } from "./session-list-predicates";
@@ -36,6 +42,7 @@ import {
 import { INACTIVE_SESSION_STATUS_SQL } from "@open-inspect/shared/types/session-activity";
 import { readStateFromRow, unreadSql, type ViewerReadStateRow } from "./session-read-state";
 import { parseSessionRow, toSessionFields as toEntry, type SessionRow } from "./session-row";
+import { SessionAuditStore } from "./session-audit";
 import type { SqlDatabase, SqlStatement } from "./sql-database";
 
 const CHILD_ADMISSION_LEASE_TTL_MS = 5 * 60 * 1000;
@@ -109,12 +116,19 @@ export interface SessionEntry {
    */
   pullRequestSummary?: PullRequestSummary;
   readState?: SessionReadState;
-  /** Resolved manifest to persist atomically with a new top-level session. */
-  skillManifest?: SessionSkillManifestInput;
-  /** Parent manifest to copy atomically for an agent-spawned child. */
-  skillManifestSourceSessionId?: string;
+}
+
+/** Declarative fields used only when creating a session index row. */
+export interface CreateSessionCommand extends SessionEntry {
+  /** Memory selection to pin atomically with the session row. */
+  memory?: Pinned<SessionMemorySelection>;
+  /** Managed-skill manifest to pin atomically with the session row. */
+  managedSkills?: Pinned<SessionSkillManifestInput>;
   /** Complete immutable model-provider authentication snapshot. */
   providerAuth?: SessionModelProviderAuthInput[];
+  /** Copy access grants with the parent row in the creation batch. */
+  collaboratorSourceSessionId?: string;
+  privateCreationActor?: { requestId: string; actorUserId: string };
 }
 
 interface SessionModelProviderAuthRow {
@@ -200,12 +214,8 @@ export class SessionIndexStore {
     return result !== null;
   }
 
-  async create(session: SessionEntry): Promise<void> {
+  async create(session: CreateSessionCommand): Promise<void> {
     const repository = normalizeSessionRepositoryFields(session);
-
-    if (session.skillManifest && session.skillManifestSourceSessionId) {
-      throw new Error("Session cannot both resolve and copy a managed skill manifest");
-    }
 
     const providers = new Set<string>();
     for (const auth of session.providerAuth ?? []) {
@@ -270,11 +280,11 @@ export class SessionIndexStore {
         )
     );
 
-    const manifestStmts = session.skillManifest
-      ? this.bindManifestInserts(session.id, session.skillManifest)
-      : session.skillManifestSourceSessionId
-        ? this.bindManifestCopy(session.id, session.skillManifestSourceSessionId)
-        : [];
+    const manifestStmts = !session.managedSkills
+      ? []
+      : session.managedSkills.kind === "resolved"
+        ? this.bindManifestInserts(session.id, session.managedSkills.value)
+        : this.bindManifestCopy(session.id, session.managedSkills.parentSessionId);
     const providerAuthStmts = (session.providerAuth ?? []).map((auth) =>
       this.db
         .prepare(
@@ -303,7 +313,54 @@ export class SessionIndexStore {
       sessionStmt,
       ...repositoryStmts,
       ...manifestStmts,
+      ...(session.memory
+        ? new SessionMemorySelectionStore(this.db).bindPinned(session.id, session.memory)
+        : []),
       ...providerAuthStmts,
+      ...(session.collaboratorSourceSessionId
+        ? [
+            this.db
+              .prepare(
+                `INSERT INTO session_collaborators (session_id, user_id, added_by, created_at)
+         SELECT ?, user_id, added_by, ? FROM session_collaborators WHERE session_id = ?`
+              )
+              .bind(session.id, session.createdAt, session.collaboratorSourceSessionId),
+          ]
+        : []),
+      ...(session.collaboratorSourceSessionId && session.visibility === "private"
+        ? [
+            this.db
+              .prepare(
+                `INSERT INTO session_collaborators (session_id, user_id, added_by, created_at)
+                 SELECT ?, parent.user_id, parent.user_id, ? FROM sessions parent
+                 WHERE parent.id = ? AND parent.user_id IS NOT NULL AND parent.user_id != ?
+                 ON CONFLICT (session_id, user_id) DO NOTHING`
+              )
+              .bind(
+                session.id,
+                session.createdAt,
+                session.collaboratorSourceSessionId,
+                session.userId
+              ),
+          ]
+        : []),
+      ...(session.visibility === "private" && session.privateCreationActor
+        ? [
+            new SessionAuditStore(this.db).bind({
+              requestId: session.privateCreationActor.requestId,
+              actorUserId: session.privateCreationActor.actorUserId,
+              action: "session.created_private",
+              sessionId: session.id,
+              teamId: session.ownerTeamId,
+              before: {},
+              after: {
+                ownerUserId: session.userId ?? null,
+                teamId: session.ownerTeamId,
+                visibility: "private",
+              },
+            }),
+          ]
+        : []),
     ]);
 
     // Session ids are always freshly generated, so a skipped insert is a bug;
@@ -397,6 +454,23 @@ export class SessionIndexStore {
     return row ? toEntry(row) : null;
   }
 
+  async getByIds(sessionIds: readonly string[]): Promise<ReadonlyMap<string, SessionEntry>> {
+    const result = new Map<string, SessionEntry>();
+    const uniqueIds = [...new Set(sessionIds)];
+    for (let offset = 0; offset < uniqueIds.length; offset += MAX_D1_QUERY_PARAMETERS) {
+      const ids = uniqueIds.slice(offset, offset + MAX_D1_QUERY_PARAMETERS);
+      const rows = await this.db
+        .prepare(`SELECT * FROM sessions WHERE id IN (${ids.map(() => "?").join(", ")})`)
+        .bind(...ids)
+        .all();
+      for (const value of rows.results) {
+        const row = parseSessionRow(value);
+        if (row) result.set(row.id, toEntry(row));
+      }
+    }
+    return result;
+  }
+
   private async getProviderAuth(sessionId: string): Promise<SessionModelProviderAuthInput[]> {
     const result = await this.db
       .prepare(
@@ -468,7 +542,7 @@ export class SessionIndexStore {
   }
 
   /** List sessions with optional viewer-specific read state. */
-  async list(options: ListSessionsOptions = {}): Promise<ListSessionsResult> {
+  async list(options: ListSessionsOptions): Promise<ListSessionsResult> {
     const {
       limit = DEFAULT_SESSION_LIST_LIMIT,
       offset = DEFAULT_SESSION_LIST_OFFSET,
@@ -479,6 +553,7 @@ export class SessionIndexStore {
     // `id DESC` breaks updated_at ties so offset pages never overlap or skip.
     const pageSql = `SELECT * FROM sessions ${where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`;
     const pageParams = [...params, limit + 1, offset];
+    assertD1QueryParameterLimit(pageParams.length + (viewerUserId ? 1 : 0));
     const result = viewerUserId
       ? await this.db
           .prepare(
@@ -759,10 +834,20 @@ export class SessionIndexStore {
   }
 
   /** List children of a parent session, newest first. */
-  async listByParent(parentSessionId: string): Promise<SessionEntry[]> {
+  async listByParent(
+    parentSessionId: string,
+    readScope: SessionReadScope,
+    mode: TeamsEnforcementMode
+  ): Promise<SessionEntry[]> {
+    const visibility =
+      readScope.kind === "internal"
+        ? { sql: "", params: [] }
+        : visibleSessionsPredicate("sessions", readScope, { mode });
     const result = await this.db
-      .prepare(`SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY created_at DESC`)
-      .bind(parentSessionId)
+      .prepare(
+        `SELECT * FROM sessions WHERE parent_session_id = ? ${visibility.sql ? `AND ${visibility.sql}` : ""} ORDER BY created_at DESC`
+      )
+      .bind(parentSessionId, ...visibility.params)
       .all<SessionRow>();
     return this.attachListMetadata((result.results || []).map(toEntry));
   }

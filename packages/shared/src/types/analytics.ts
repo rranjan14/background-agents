@@ -2,6 +2,7 @@ import { spawnSourceSchema, type SpawnSource } from "./sessions";
 
 export const ANALYTICS_DAYS = [7, 14, 30, 90] as const;
 export type AnalyticsDays = (typeof ANALYTICS_DAYS)[number];
+export const DEFAULT_ANALYTICS_DAYS: AnalyticsDays = 30;
 
 export const ANALYTICS_BREAKDOWN_BY = [
   "user",
@@ -70,6 +71,8 @@ export interface AnalyticsSummaryResponse extends AnalyticsTokenTotals {
   totalSessions: number;
   activeUsers: number;
   totalCost: number;
+  /** Private-session cost in the same window and scope; only owner/administrator viewers receive it. */
+  privateSessionsCostUsd: number | null;
   avgCost: number;
   totalPrs: number;
   cacheHitRatio: number | null;
@@ -78,6 +81,10 @@ export interface AnalyticsSummaryResponse extends AnalyticsTokenTotals {
 
 export interface AnalyticsTimeseriesPoint {
   date: string;
+  /**
+   * Sessions created that day per user, keyed like the user breakdown: user ID,
+   * else SCM login, else __unknown__. Display names live on the breakdown entries.
+   */
   groups: Record<string, number>;
 }
 
@@ -105,7 +112,15 @@ export interface AnalyticsBreakdownResponse {
   entries: AnalyticsBreakdownEntry[];
 }
 
-/** All sessions in one root_session_id family, attributed to the root. */
+export interface AnalyticsSessionOriginEntry {
+  source: SpawnSource;
+  /** Canonical user ID, legacy SCM login, or __unknown__; not necessarily a human creator. */
+  userKey: string;
+  displayName: string;
+  sessions: number;
+}
+
+/** Sessions in one root_session_id family, attributed to its visible root. */
 export interface SessionRun {
   rootSessionId: string;
   title: string | null;
@@ -219,6 +234,7 @@ export interface AnalyticsDashboardResponse {
   };
   summary: AnalyticsSummaryResponse;
   timeseries: AnalyticsTimeseriesResponse;
+  sessionOrigins: AnalyticsSessionOriginEntry[];
   breakdowns: {
     repository: AnalyticsBreakdownResponse;
     user: AnalyticsBreakdownResponse;

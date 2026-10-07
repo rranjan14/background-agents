@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .docker_service import DockerService
     from .harness.base import HarnessProcessOwner
     from .managed_skills import ManagedSkillsMaterializer
+    from .memories import MemoryMaterializer
     from .repository_boot import RepositoryBoot, RepositoryBootResult
     from .web_terminal import WebTerminal
 
@@ -72,6 +73,7 @@ class SandboxSupervisor:
         shutdown_event: asyncio.Event,
         log: Any,
         *,
+        memory: MemoryMaterializer | None = None,
         boot_events: BootEventLog | None = None,
         docker_service: DockerService | None = None,
     ) -> None:
@@ -80,7 +82,11 @@ class SandboxSupervisor:
         # Present only for Docker-enabled sandboxes: started before repository
         # hooks, watched for the whole session, stopped last.
         self.docker_service = docker_service
-        self.docker_control = DockerControl(docker_service) if docker_service is not None else None
+        self.docker_control = (
+            DockerControl(docker_service, recover=self._recover_docker_after_prepare)
+            if docker_service is not None
+            else None
+        )
         self._docker_watch_task: asyncio.Task[None] | None = None
         self._docker_watch_failure: BaseException | None = None
         # The boot-events channel the bridge relays; the repository boot
@@ -95,6 +101,7 @@ class SandboxSupervisor:
         self.code_server = code_server
         self.web_terminal = web_terminal
         self.browser_desktop = browser_desktop
+        self.memory = memory
         self.managed_skills = managed_skills
         self.shutdown_event = shutdown_event
         self.log = log
@@ -418,6 +425,37 @@ class SandboxSupervisor:
         # by ``run`` rather than treated as a requested shutdown.
         self.shutdown_event.set()
 
+    async def _recover_docker_after_prepare(self) -> None:
+        """Replace a daemon after a failed snapshot attempt without losing session supervision."""
+        service = self.docker_service
+        assert service is not None
+        control = self.docker_control
+        if control is not None and control.stopping:
+            return
+        if not service.exit_expected:
+            # Preparation never signalled this daemon; its exit belongs to
+            # ordinary crash supervision, not failed-save recovery.
+            return
+        await self._stop_docker_watch()
+        try:
+            await service.stop()
+            if control is not None and control.stopping:
+                return
+            await service.start()
+        except BaseException as error:
+            if control is not None and control.stopping:
+                raise
+            self.log.error("docker.exited_unexpectedly", exc=error)
+            self._docker_watch_failure = RuntimeError(
+                "Required Docker daemon exited unexpectedly after failed preparation"
+            )
+            self.shutdown_event.set()
+            raise
+        if control is not None and control.stopping:
+            return
+        self._docker_watch_task = asyncio.create_task(self._watch_docker())
+        self.log.info("docker.restarted_after_prepare")
+
     async def _stop_docker_watch(self) -> None:
         task = self._docker_watch_task
         if task is None:
@@ -589,6 +627,10 @@ class SandboxSupervisor:
         if self.managed_skills is not None:
             with self.boot_events.phase_scope("skills"):
                 await self.managed_skills.materialize(boot_result.repositories, boot_result.workdir)
+
+        if self.memory is not None:
+            with self.boot_events.phase_scope("memory"):
+                await self.memory.materialize()
 
         try:
             await self.code_server.start(boot_result.workdir)
@@ -770,6 +812,8 @@ class SandboxSupervisor:
             )
             return False
         finally:
+            if self.docker_control is not None:
+                await self.docker_control.stop()
             await self._stop_docker_watch()
             await self._stop_bridge_watch()
             await self.shutdown()

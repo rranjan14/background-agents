@@ -7,6 +7,8 @@ import { AnalyticsStore } from "./analytics-store";
 import { PullRequestAnalyticsStore } from "./pull-request-analytics-store";
 import { SessionRunStore } from "./session-run-store";
 import type { SqlDatabase } from "./sql-database";
+import type { SessionReadScope } from "./session-visibility";
+import type { TeamsEnforcementMode } from "../authorization/teams-enforcement";
 
 export interface AnalyticsDashboardFilters {
   days: AnalyticsDays;
@@ -18,12 +20,16 @@ export interface AnalyticsDashboardFilters {
 export const DASHBOARD_RUNS_LIMIT = 20;
 
 export class AnalyticsDashboardStore {
-  constructor(private readonly db: SqlDatabase) {}
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly readScope: SessionReadScope,
+    private readonly mode: TeamsEnforcementMode
+  ) {}
 
   async get(filters: AnalyticsDashboardFilters): Promise<AnalyticsDashboardResponse> {
-    const analytics = new AnalyticsStore(this.db);
-    const pullRequests = new PullRequestAnalyticsStore(this.db);
-    const runs = new SessionRunStore(this.db);
+    const analytics = new AnalyticsStore(this.db, this.readScope, this.mode);
+    const pullRequests = new PullRequestAnalyticsStore(this.db, this.readScope, this.mode);
+    const runs = new SessionRunStore(this.db, this.readScope, this.mode);
     const sessionFilters = {
       startAt: filters.startAt,
       endAt: filters.endAt,
@@ -45,6 +51,7 @@ export class AnalyticsDashboardStore {
       harness,
       automation,
       billing,
+      sessionOrigins,
       ...pullRequestAndRunResults
     ] = await this.db.batch([
       analytics.prepareSummary(sessionFilters),
@@ -55,6 +62,7 @@ export class AnalyticsDashboardStore {
       analytics.prepareBreakdown(sessionFilters, "harness"),
       analytics.prepareBreakdown(sessionFilters, "automation"),
       billingStatement,
+      analytics.prepareSessionOrigins(sessionFilters),
       ...pullRequestStatements,
       runs.prepareList({ ...sessionFilters, limit: DASHBOARD_RUNS_LIMIT, orderBy: "cost" }),
     ]);
@@ -72,6 +80,7 @@ export class AnalyticsDashboardStore {
       },
       summary: analytics.decodeSummary(summary),
       timeseries: analytics.decodeTimeseries(timeseries),
+      sessionOrigins: analytics.decodeSessionOrigins(sessionOrigins),
       breakdowns: {
         repository: analytics.decodeBreakdown(repository, "repo"),
         user: analytics.decodeBreakdown(user, "user"),

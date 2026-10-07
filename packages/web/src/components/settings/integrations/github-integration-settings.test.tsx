@@ -13,6 +13,11 @@ import {
 } from "@open-inspect/shared/types/integrations";
 import { GitHubIntegrationSettings } from "./github-integration-settings";
 
+let search = "";
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(search),
+}));
+
 vi.mock("@/hooks/use-current-user-authorization", () => ({
   useCurrentUserAuthorization: () => ({ hasPermission: () => true }),
 }));
@@ -40,6 +45,10 @@ vi.mock("@/hooks/use-enabled-models", () => ({
       {
         category: "Anthropic",
         models: [{ id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6" }],
+      },
+      {
+        category: "OpenAI",
+        models: [{ id: "openai/gpt-5.4", name: "GPT 5.4" }],
       },
     ],
   }),
@@ -130,6 +139,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  search = "";
   fetchMock.mockReset();
   toastSuccess.mockReset();
   toastError.mockReset();
@@ -144,6 +154,79 @@ afterEach(() => {
 });
 
 describe("GitHubIntegrationSettings", () => {
+  it("marks global auto-review deprecated with an accessible team-owned template replacement", () => {
+    setupSWR({ global: null });
+
+    render(<GitHubIntegrationSettings />);
+
+    const toggle = screen.getByRole("switch", { name: /auto-review new prs/i });
+    const label = toggle.closest("label")!;
+    expect(label).toHaveAttribute("for", toggle.id);
+    expect(within(label).getByText("Deprecated")).toBeInTheDocument();
+    expect(within(label).queryByRole("link")).not.toBeInTheDocument();
+    expect(toggle).toHaveAccessibleDescription(/team-owned automation/);
+    expect(toggle).toHaveAccessibleDescription(/workspace-owned sessions/);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("link", { name: "Review new PRs" })).toHaveAttribute(
+      "href",
+      "/automations/new?template=review-new-prs&requireTeam=true"
+    );
+  });
+
+  it("preserves the current team scope in both replacement links", () => {
+    search = "teamId=team_engineering";
+    setupSWR({
+      global: null,
+      repos: [{ repo: "acme/web", settings: {} }],
+      availableRepos: [repo("acme/web")],
+    });
+
+    render(<GitHubIntegrationSettings />);
+
+    const links = screen.getAllByRole("link", { name: "Review new PRs" });
+    expect(links).toHaveLength(2);
+    for (const link of links) {
+      expect(link).toHaveAttribute(
+        "href",
+        "/automations/new?template=review-new-prs&teamId=team_engineering&requireTeam=true"
+      );
+    }
+  });
+
+  it.each([undefined, false, true])(
+    "shows the deprecation notice and template for repo auto-review=%s without changing controls",
+    (autoReviewOnOpen) => {
+      setupSWR({
+        global: { defaults: { autoReviewOnOpen: true } },
+        repos: [{ repo: "acme/web", settings: { autoReviewOnOpen } }],
+        availableRepos: [repo("acme/web")],
+      });
+
+      render(<GitHubIntegrationSettings />);
+
+      const controls = autoReviewControls(repoOverrideRow("acme/web"));
+      expect(within(controls).getByText("Deprecated")).toBeInTheDocument();
+      expect(within(controls).getByRole("link", { name: "Review new PRs" })).toHaveAttribute(
+        "href",
+        "/automations/new?template=review-new-prs&requireTeam=true"
+      );
+      expect(within(controls).getByRole("combobox")).toHaveAccessibleDescription(
+        /team-owned automation/
+      );
+      if (autoReviewOnOpen === undefined) {
+        expect(within(controls).queryByRole("switch")).not.toBeInTheDocument();
+        expect(within(controls).getByRole("combobox")).toHaveTextContent("Use global default");
+      } else {
+        const toggle = within(controls).getByRole("switch", {
+          name: autoReviewOnOpen ? "Enabled" : "Disabled",
+        });
+        expect(toggle.closest("label")).not.toBeNull();
+        expect(toggle).toHaveAttribute("aria-checked", String(autoReviewOnOpen));
+        expect(toggle).toHaveAccessibleDescription(/workspace-owned sessions/);
+      }
+    }
+  );
+
   it("starts integration content at heading level two", () => {
     setupSWR({ global: null });
 
@@ -434,4 +517,183 @@ describe("GitHubIntegrationSettings", () => {
       );
     }
   );
+
+  it("saves a global Claude Agent harness choice", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: { defaults: { autoReviewOnOpen: true } },
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+
+    render(<GitHubIntegrationSettings />);
+
+    await user.click(screen.getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "Claude Agent" }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/integration-settings/github",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          settings: { defaults: { autoReviewOnOpen: true, harness: "claude" } },
+        }),
+      })
+    );
+  });
+
+  it("saves a per-repo Claude Agent harness override", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: { defaults: { autoReviewOnOpen: true } },
+      repos: [{ repo: "acme/web", settings: {} }],
+      availableRepos: [repo("acme/web")],
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+
+    render(<GitHubIntegrationSettings />);
+
+    const row = repoOverrideRow("acme/web");
+    await user.click(within(row).getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "Claude Agent" }));
+    await user.click(within(row).getByRole("button", { name: /^save$/i }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/integration-settings/github/repos/acme/web",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ settings: { harness: "claude" } }),
+      })
+    );
+  });
+
+  it("returns a repo harness override to the global harness", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: { defaults: { autoReviewOnOpen: true } },
+      repos: [{ repo: "acme/web", settings: { harness: "claude" } }],
+      availableRepos: [repo("acme/web")],
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+
+    render(<GitHubIntegrationSettings />);
+
+    const row = repoOverrideRow("acme/web");
+    // The single harness selector holds the override; inheriting clears it.
+    expect(within(row).getByRole("combobox", { name: "Agent harness" })).toHaveTextContent(
+      "Claude Agent"
+    );
+    await user.click(within(row).getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "Use global harness" }));
+    await user.click(within(row).getByRole("button", { name: /^save$/i }));
+
+    // Sparse save: no harness key means the repo inherits the global one.
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/integration-settings/github/repos/acme/web",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ settings: {} }),
+      })
+    );
+  }, 20000);
+
+  it("filters the repo model picker by the inherited global harness", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: {
+        defaults: {
+          autoReviewOnOpen: true,
+          harness: "claude",
+          model: "anthropic/claude-sonnet-4-6",
+        },
+      },
+      repos: [{ repo: "acme/web", settings: {} }],
+      availableRepos: [repo("acme/web")],
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+
+    render(<GitHubIntegrationSettings />);
+
+    const row = repoOverrideRow("acme/web");
+    await user.click(within(row).getByRole("combobox", { name: "Model" }));
+    await screen.findByRole("option", { name: "Claude Sonnet 4.6" });
+    // Global harness is Claude Agent: GPT models are not offered for this repo.
+    expect(screen.queryByRole("option", { name: "GPT 5.4" })).toBeNull();
+  }, 20000);
+
+  it("warns on an inherited model the repo harness cannot run, keeping sparse overrides", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: { defaults: { autoReviewOnOpen: true, model: "openai/gpt-5.4" } },
+      repos: [{ repo: "acme/web", settings: { harness: "claude" } }],
+      availableRepos: [repo("acme/web")],
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+
+    render(<GitHubIntegrationSettings />);
+
+    const row = repoOverrideRow("acme/web");
+    expect(within(row).getByText(/cannot run on the Claude Agent harness/)).toBeInTheDocument();
+
+    // Cycle the harness to dirty the form; the save stays a sparse override.
+    await user.click(within(row).getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "OpenCode" }));
+    await user.click(within(row).getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "Claude Agent" }));
+    await user.click(within(row).getByRole("button", { name: /^save$/i }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/integration-settings/github/repos/acme/web",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ settings: { harness: "claude" } }),
+      })
+    );
+  }, 20000);
+  it("clears incompatible model and effort when inheriting the global Claude harness", async () => {
+    const user = userEvent.setup();
+    setupSWR({
+      global: { defaults: { harness: "claude", model: "anthropic/claude-sonnet-4-6" } },
+      repos: [
+        {
+          repo: "acme/web",
+          settings: { harness: "opencode", model: "openai/gpt-5.4", reasoningEffort: "high" },
+        },
+      ],
+      availableRepos: [repo("acme/web")],
+    });
+    fetchMock.mockResolvedValue(okJson({}));
+    render(<GitHubIntegrationSettings />);
+    const row = repoOverrideRow("acme/web");
+    await user.click(within(row).getByRole("combobox", { name: "Agent harness" }));
+    await user.click(await screen.findByRole("option", { name: "Use global harness" }));
+    await user.click(within(row).getByRole("button", { name: /^save$/i }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/integration-settings/github/repos/acme/web",
+      expect.objectContaining({ method: "PUT", body: JSON.stringify({ settings: {} }) })
+    );
+    expect(
+      within(row).queryByText(/cannot run on the Claude Agent harness/)
+    ).not.toBeInTheDocument();
+  });
+
+  it("explains deployment-default model fallback for global and inherited Claude harnesses", () => {
+    setupSWR({
+      global: { defaults: { harness: "claude" } },
+      repos: [{ repo: "acme/web", settings: {} }],
+      availableRepos: [repo("acme/web")],
+    });
+    render(<GitHubIntegrationSettings />);
+    expect(screen.getAllByText(/deployment default model/)).toHaveLength(2);
+  });
+
+  it("predicts the harness using the canonical model for retired stored settings", () => {
+    setupSWR({
+      global: { defaults: { harness: "claude", model: "openai/gpt-5" } },
+      repos: [{ repo: "acme/web", settings: {} }],
+      availableRepos: [repo("acme/web")],
+    });
+    render(<GitHubIntegrationSettings />);
+    expect(screen.queryAllByText(/cannot run on the Claude Agent harness/)).toHaveLength(0);
+  });
 });

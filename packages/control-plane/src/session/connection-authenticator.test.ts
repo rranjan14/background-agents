@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { hashToken } from "../auth/crypto";
+import { createCloudflareBackgroundTasks } from "../cloudflare/background-tasks";
 import type { Logger } from "../logger";
 import type { BackgroundTasks } from "../platform-ports";
 import {
@@ -121,10 +122,11 @@ function createHarness(opts: {
   };
   const broadcast = vi.fn();
   const submitted: string[] = [];
+  const background = createCloudflareBackgroundTasks({ waitUntil: vi.fn() }, log);
   const backgroundTasks: BackgroundTasks = {
     submit: (task, metadata) => {
       submitted.push(metadata.name);
-      void task();
+      background.submit(task, metadata);
     },
   };
   const processMessageQueue = vi.fn(async () => undefined);
