@@ -22,6 +22,8 @@
  */
 
 import { resolveAppName } from "@open-inspect/shared/app-name";
+import { HarnessAdmissionError, validateHarnessExecution } from "../harness-admission";
+import { getValidHarnessOrDefault } from "@open-inspect/shared/harnesses";
 import { DEFAULT_MODEL } from "@open-inspect/shared/models";
 import { sandboxPromptBlockReason } from "@open-inspect/shared/types/sandbox-shutdown";
 import { generateId, hashToken } from "../auth/crypto";
@@ -486,6 +488,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     messages: messageRepository,
     failures: messageFailures,
     messenger,
+    events: eventRepository,
     sockets: wsManager,
     alarm: alarmScheduler,
     background: backgroundTasks,
@@ -539,7 +542,19 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     participantService,
     callbackService,
     statusService,
-    (model) => userEnvResolver.getProviderAuthenticationError(model),
+    async (model) => {
+      const session = sessionCoreRepository.getSession();
+      try {
+        await validateHarnessExecution(db, env, {
+          harness: getValidHarnessOrDefault(session?.harness),
+          model,
+        });
+      } catch (error) {
+        if (error instanceof HarnessAdmissionError) return error.message;
+        throw error;
+      }
+      return userEnvResolver.getProviderAuthenticationError(model);
+    },
     messageFailures,
     lifecycleManager,
     sessionIndexStore,
@@ -668,6 +683,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     log,
     preserveBeforeWatchdogs: (allowCaptureRetry) =>
       lifecycleManager.handleShutdownAlarm(allowCaptureRetry),
+    redriveIdleQueue: () => lifecycleManager.redriveIdleQueue(),
   });
 
   const schedulePullRequestRefresh = (trigger: "open" | "manual"): void => {
@@ -923,6 +939,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     snapshot: () => snapshotReader.handleSnapshot(),
     sandboxAccess: () => accessReader.handleSandboxAccess(),
     prompt: (request, _url, requestLog) => messagesHandler.enqueuePrompt(request, requestLog),
+    promptRequest: (_request, url) => messagesHandler.lookupPromptRequest(url),
     autofix: (request, _url, requestLog) => autofixHandler.handle(request, requestLog),
     stop: () => messagesHandler.stop(),
     sandboxEvent: (request) => sandboxHandler.sandboxEvent(request),
@@ -1062,6 +1079,9 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
             await wsManager.expireAuthorizationLeases(Date.now());
             await alarmScheduler.rehydrate();
             await lifecycleManager.rearmRejectedStartupCleanupAlarm();
+            await lifecycleManager.rearmCaptureSettlement();
+            await lifecycleManager.replayPendingFatalReport();
+            await lifecycleManager.redriveIdleQueue();
             await terminalMessageProjection.rearm();
           },
           {
