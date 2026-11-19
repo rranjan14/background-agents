@@ -9,6 +9,7 @@ import {
   VALID_MODELS,
   applyModelPreferenceChanges,
   extractProviderAndModel,
+  getCodexReasoningConfig,
   getSubscriptionProviderForModel,
   getDefaultReasoningEffort,
   getReasoningConfig,
@@ -47,6 +48,9 @@ const OPENAI_MODELS = [
   "openai/gpt-6-astra",
   "openai/gpt-6-sol",
   "openai/gpt-6.1-sol",
+  "openai/gpt-6.1-terra",
+  "openai/gpt-6.2-astra",
+  "openai/gpt-6.2-sol",
   "openai/gpt-6-luna",
 ] as const;
 
@@ -61,11 +65,15 @@ const ZEN_MODELS = [
   "opencode/glm-5",
   "opencode/glm-5.1",
   "opencode/glm-5.2",
+  "opencode/gemini-4-carbon",
+  "opencode/gemini-4-argon",
+  "opencode/gemini-3.8-flash",
 ] as const;
 
 const GO_MODELS = [
   "opencode-go/grok-4.6",
   "opencode-go/gpt-5.6-luna",
+  "opencode-go/gemini-4-argon",
   "opencode-go/glm-5.3-flash",
   "opencode-go/glm-5.3",
   "opencode-go/glm-5.2",
@@ -94,7 +102,37 @@ const GO_MODELS = [
 ] as const;
 
 const DEEPSEEK_MODELS = ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"] as const;
+const KIMI_CODE_PLAN_MODELS = [
+  "kimi-code-plan-global/k3.1-pro",
+  "kimi-code-plan-global/k3.1-pro-highspeed",
+  "kimi-code-plan-global/k3",
+  "kimi-code-plan-global/k3-256k",
+  "kimi-code-plan-global/kimi-for-coding",
+  "kimi-code-plan-global/kimi-for-coding-highspeed",
+] as const;
 const ZAI_CODING_PLAN_MODELS = ["zai-coding-plan/glm-5.2", "zai-coding-plan/glm-5.3"] as const;
+
+it("keeps the OpenCode gateway wire-test efforts aligned with the catalog", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../sandbox-runtime/tests/fixtures/opencode-gateway-efforts.json",
+        import.meta.url
+      ),
+      "utf8"
+    )
+  );
+  const expected = Object.fromEntries(
+    MODEL_CATALOG.flatMap((group) => group.models)
+      .filter(
+        (model) =>
+          (model.id.startsWith("opencode/") || model.id.startsWith("opencode-go/")) &&
+          "reasoning" in model
+      )
+      .map((model) => [model.id, [...model.reasoning.efforts]])
+  );
+  expect(fixture).toEqual(expected);
+});
 
 it.each([
   "../../../docs/AVAILABLE_MODELS.md",
@@ -124,6 +162,36 @@ it.each([
     } else {
       expect(row?.at(-1)).toBe("N/A");
     }
+  }
+});
+
+it("keeps the Codex effort table in choosing-a-model.mdx aligned with the catalog", () => {
+  const lines = readFileSync(
+    new URL("../../../packages/docs/content/docs/models/choosing-a-model.mdx", import.meta.url),
+    "utf8"
+  ).split("\n");
+  const header = lines.findIndex(
+    (line) => line.startsWith("| Display name") && line.includes("Codex efforts")
+  );
+  const body = lines.slice(header + 2);
+  const end = body.findIndex((line) => !line.startsWith("|"));
+  const rows = body.slice(0, end === -1 ? undefined : end).map((line) =>
+    line
+      .split("|")
+      .slice(1, -1)
+      .map((cell) => cell.trim())
+  );
+  const openAiModels = MODEL_CATALOG.flatMap((group) => group.models).filter(({ id }) =>
+    id.startsWith("openai/")
+  );
+
+  expect(header).toBeGreaterThan(-1);
+  expect(rows.map(([name]) => name)).toEqual(openAiModels.map(({ name }) => name));
+  for (const model of openAiModels) {
+    const row = rows.find(([name]) => name === model.name);
+    const codex = getCodexReasoningConfig(model.id);
+    expect(row?.[1]).toBe(codex ? codex.efforts.join(", ") : "Not on Codex");
+    expect(row?.[2]).toBe(codex ? (codex.default ?? "Not set") : "N/A");
   }
 });
 
@@ -175,6 +243,7 @@ describe("model utilities", () => {
       ...XAI_MODELS,
       ...ZEN_MODELS,
       ...GO_MODELS,
+      ...KIMI_CODE_PLAN_MODELS,
       ...ZAI_CODING_PLAN_MODELS,
       ...DEEPSEEK_MODELS,
     ]) {
@@ -469,6 +538,16 @@ describe("model utilities", () => {
       efforts: ["low", "medium", "high", "xhigh", "max"],
       default: "medium",
     });
+    expect(getReasoningConfig("openai/gpt-6.1-terra")).toEqual({
+      efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      default: "medium",
+    });
+    for (const model of ["openai/gpt-6.2-astra", "openai/gpt-6.2-sol"]) {
+      expect(getReasoningConfig(model)).toEqual({
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        default: "medium",
+      });
+    }
     expect(getReasoningConfig("openai/gpt-5.6-sol")).toEqual({
       efforts: ["none", "low", "medium", "high", "xhigh"],
       default: "medium",
@@ -521,6 +600,12 @@ describe("model utilities", () => {
     expect(isValidReasoningEffort("openai/gpt-6-sol", "max")).toBe(true);
     expect(isValidReasoningEffort("openai/gpt-6.1-sol", "max")).toBe(true);
     expect(isValidReasoningEffort("openai/gpt-6.1-sol", "none")).toBe(false);
+    expect(isValidReasoningEffort("openai/gpt-6.1-terra", "none")).toBe(true);
+    expect(isValidReasoningEffort("openai/gpt-6.1-terra", "max")).toBe(true);
+    expect(isValidReasoningEffort("openai/gpt-6.2-astra", "max")).toBe(true);
+    expect(isValidReasoningEffort("openai/gpt-6.2-astra", "none")).toBe(false);
+    expect(isValidReasoningEffort("openai/gpt-6.2-sol", "max")).toBe(true);
+    expect(isValidReasoningEffort("openai/gpt-6.2-sol", "none")).toBe(false);
     expect(isValidReasoningEffort("openai/gpt-6-luna", "none")).toBe(true);
     expect(isValidReasoningEffort("openai/gpt-6-luna", "max")).toBe(true);
     expect(isValidReasoningEffort("openai/gpt-5.6-sol", "xhigh")).toBe(true);
@@ -557,6 +642,9 @@ describe("model utilities", () => {
       MODEL_OPTIONS.find((group) => group.category === "OpenCode Go")?.models.map((m) => m.id)
     ).toEqual(GO_MODELS);
     expect(
+      MODEL_OPTIONS.find((group) => group.category === "Kimi Coding Plan")?.models.map((m) => m.id)
+    ).toEqual(KIMI_CODE_PLAN_MODELS);
+    expect(
       MODEL_OPTIONS.find((group) => group.category === "Z.AI Coding Plan")?.models.map((m) => m.id)
     ).toEqual(ZAI_CODING_PLAN_MODELS);
     expect(
@@ -568,6 +656,7 @@ describe("model utilities", () => {
       ...XAI_MODELS,
       ...ZEN_MODELS,
       ...GO_MODELS,
+      ...KIMI_CODE_PLAN_MODELS,
       ...ZAI_CODING_PLAN_MODELS,
       ...DEEPSEEK_MODELS,
     ]) {
